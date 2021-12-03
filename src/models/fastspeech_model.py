@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from src.models.transformer_block import TransformerEncoderLayer
+from src.models.duration_predictor import DurationPredictor
 import math
 
 
@@ -81,6 +82,8 @@ class FastSpeechModel(nn.Module):
         super().__init__()
         if activation == 'relu':
             activation = nn.ReLU
+        elif activation == 'gelu':
+            activation = nn.GELU
         args = [n_layers,
                 model_size,
                 intermidiate_size,
@@ -96,13 +99,11 @@ class FastSpeechModel(nn.Module):
         self.encoder = Transformer(*args)
         self.decoder = Transformer(*args)
         self.output_layer = nn.Linear(model_size, output_size)
+        self.duration_predictor = DurationPredictor(model_size)
 
-    def forward(self, batch):
+    def forward(self, batch, train=True):
         tokens = batch["tokens"]
-        melspec = batch["melspec"]
-        melspec_length = batch["melspec_length"]
         tokens_length = batch["token_lengths"]
-        duration_multipliers = batch["duration_multipliers"]
 
         tokens_embeddings = self.embedding_layer(tokens)
         tokens_embeddings = tokens_embeddings + self.tokens_positions(tokens_embeddings)
@@ -110,16 +111,22 @@ class FastSpeechModel(nn.Module):
         attention_mask = (torch.arange(tokens.shape[1])[None, :] > tokens_length[:, None]).float()
         attention_mask[attention_mask == 1] = -torch.inf
         encoder_result = self.encoder(tokens_embeddings, attention_mask)
+        length_predictions = self.duration_predictor(encoder_result).squeeze(2)
 
-        input_to_decoder = duplicate_by_duration(encoder_result, duration_multipliers)
-        mask = (torch.arange(input_to_decoder.shape[1])[None, :] <= melspec_length[:, None]).float()
-        input_to_decoder = input_to_decoder * mask[:, :, None]
-        attention_mask = (torch.arange(input_to_decoder.shape[1])[None, :] > melspec_length[:, None]).float()
-        attention_mask[attention_mask == 1] = -torch.inf
+        if train:
+            melspec_length = batch["melspec_length"]
+            duration_multipliers = batch["duration_multipliers"]
+            input_to_decoder = duplicate_by_duration(encoder_result, duration_multipliers)
+            mask = (torch.arange(input_to_decoder.shape[1])[None, :] <= melspec_length[:, None]).float()
+            input_to_decoder = input_to_decoder * mask[:, :, None]
+            attention_mask = (torch.arange(input_to_decoder.shape[1])[None, :] > melspec_length[:, None]).float()
+            attention_mask[attention_mask == 1] = -torch.inf
+        else:
+            duration_multipliers = (torch.exp(length_predictions) - 1).round().int()
+            duration_multipliers[duration_multipliers < 1] = 1
+            input_to_decoder = duplicate_by_duration(encoder_result, duration_multipliers)
+            attention_mask = torch.zeros(input_to_decoder.shape[:2])
         output = self.decoder(input_to_decoder, attention_mask)
-
         output = self.output_layer(output)
         output = output.permute(0, 2, 1)
-        return output
-        # output_attention_mask = (torch.arange(input_to_decoder.shape[1])[None, :] <= melspec_length[:, None]).float()
-        # return output * output_attention_mask[:, None, :]
+        return output, length_predictions

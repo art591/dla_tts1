@@ -30,10 +30,9 @@ class SelfAttention(nn.Module):
 class IntermidiateLayer(nn.Module):
     def __init__(self, model_size, intermidiate_size, kernel_size, activation, normalization_type, dropout_prob):
         super().__init__()
-        print(model_size, intermidiate_size, kernel_size)
-        self.intermidiate = nn.Sequential(nn.Conv1d(model_size, intermidiate_size, kernel_size=kernel_size, padding='same'),
+        self.intermidiate = nn.Sequential(nn.Conv1d(model_size, intermidiate_size, kernel_size=kernel_size[0], padding='same'),
                                           activation(),
-                                          nn.Conv1d(intermidiate_size, model_size, kernel_size=1, padding='same'))
+                                          nn.Conv1d(intermidiate_size, model_size, kernel_size=kernel_size[1], padding='same'))
         self.layer_norm = nn.LayerNorm(model_size)
         self.normalization_type = normalization_type
         self.dropout = torch.nn.Dropout(dropout_prob)
