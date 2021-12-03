@@ -91,8 +91,8 @@ if __name__ == '__main__':
     batch_size = 64
     device = 'cuda'
     train_dataloader = DataLoader(LJSpeechDataset('.'), batch_size=batch_size, collate_fn=LJSpeechCollator(device))
-    model = FastSpeechModel(38, 10000, 6, 80, 256, 1024, (9, 1), 'gelu', 2, 128, 'pre', 0.1)
-    vocoder = Vocoder().eval()
+    model = FastSpeechModel(38, 10000, 6, 80, 256, 1024, (9, 1), 'gelu', 2, 128, 'pre', 0.1).to(device)
+    vocoder = Vocoder().eval().to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-6)
     scheduler = optim.lr_scheduler.OneCycleLR(optimizer,
