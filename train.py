@@ -10,8 +10,9 @@ from vocoder import Vocoder
 import wandb
 from tqdm import tqdm
 
-def train(run, train_dataloader, model, optimizer, scheduler, log_loss_every, log_audio_every):
+def train(run, epoch, train_dataloader, model, optimizer, scheduler, log_loss_every, log_audio_every):
     model.train()
+    i = 0
     for batch in tqdm(train_dataloader):
         pred_mel, pred_len = model(batch)
 
@@ -22,22 +23,38 @@ def train(run, train_dataloader, model, optimizer, scheduler, log_loss_every, lo
         loss_mel = criterion(pred_mel * mask[:, :, None], batch['melspec'] * mask[:, :, None])
         loss = loss_mel + loss_len
         if i % log_loss_every == 0 and i != 0:
-            run.log({"Train loss" : loss})
+            run.log({"Train loss" : loss}, step=epoch * len(train_dataloader) + i)
         if i % log_audio_every == 0 and i != 0:
             print("Train audio")
             mel_to_log = pred_mel[0]
             melspec_to_log  = pred_mel[0][:, :batch['melspec_length'][0]].unsqueeze(0)
             reconstructed_wav = vocoder.inference(melspec_to_log).squeeze().detach().cpu().numpy()
-            run.log({"Train Audio" : wandb.Audio(reconstructed_wav, 22050)})
+            run.log({"Train Audio" : wandb.Audio(reconstructed_wav, 22050)}, step=epoch * len(train_dataloader) + i)
+            d = (torch.exp(pred_len[0]) - 1).round().int()
+            d[d < 1] = 1
+            d1 = d.cumsum(0)
+            maxlen = d.sum().item()
+            mask1 = torch.arange(maxlen)[None, :] < (d1[:, None])
+            mask2 = torch.arange(maxlen)[None, :] >= (d1 - d)[:, None]
+            mask = (mask2 * mask1).float()
+            run.log({"Train Pred durations" : wandb.Image(mask.detach().cpu().numpy())}, step=epoch * len(train_dataloader) + i)
+            d = batch['duration_multipliers'][0]
+            d1 = d.cumsum(0)
+            maxlen = d.sum().item()
+            mask1 = torch.arange(maxlen)[None, :] < (d1[:, None])
+            mask2 = torch.arange(maxlen)[None, :] >= (d1 - d)[:, None]
+            mask = (mask2 * mask1).float()
+            run.log({"Train True durations" : wandb.Image(mask.detach().cpu().numpy())}, step=epoch * len(train_dataloader) + i)
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
         optimizer.step()
         scheduler.step()
-        break
+        i += 1
 
 
-def validation(run, model):
+
+def validation(run, iteration, model):
     model.eval()
     tokenizer  = torchaudio.pipelines.TACOTRON2_GRIFFINLIM_CHAR_LJSPEECH.get_text_processor()
     sentences = ['A defibrillator is a device that gives a high energy electric shock to the heart of someone who is in cardiac arrest',
@@ -49,22 +66,31 @@ def validation(run, model):
         batch = {}
         batch['tokens'] = tokens
         batch['token_lengths'] = length
-        pred_mel, _ = model(batch, False)
+        pred_mel, pred_len = model(batch, False)
         melspec_to_log  = pred_mel
         reconstructed_wav = vocoder.inference(melspec_to_log).squeeze().detach().cpu().numpy()
-        run.log({"Val Audio" : wandb.Audio(reconstructed_wav, 22050)})
+        d = (torch.exp(pred_len[0]) - 1).round().int()
+        d[d < 1] = 1
+        d1 = d.cumsum(0)
+        maxlen = d.sum().item()
+        mask1 = torch.arange(maxlen)[None, :] < (d1[:, None])
+        mask2 = torch.arange(maxlen)[None, :] >= (d1 - d)[:, None]
+        mask = (mask2 * mask1).float()
+        run.log({"Val Audio" : wandb.Audio(reconstructed_wav, 22050)}, step=iteration)
+        run.log({"Val durations" : wandb.Image(mask.detach().cpu().numpy())}, step=iteration)
 
 
 if __name__ == '__main__':
     experiment_path = 'first_try'
     project_name = 'tts_1'
     name = 'datasphere_first'
-    log_audio_every = 250
-    log_loss_every = 10
+    log_audio_every = 80
+    log_loss_every = 2
     save_every = 10
     n_epochs = 20
     batch_size = 64
-    train_dataloader = DataLoader(LJSpeechDataset('.'), batch_size=batch_size, collate_fn=LJSpeechCollator())
+    device = 'cuda'
+    train_dataloader = DataLoader(LJSpeechDataset('.'), batch_size=batch_size, collate_fn=LJSpeechCollator(device))
     model = FastSpeechModel(38, 10000, 6, 80, 256, 1024, (9, 1), 'gelu', 2, 128, 'pre', 0.1)
     vocoder = Vocoder().eval()
     criterion = nn.MSELoss()
@@ -79,8 +105,8 @@ if __name__ == '__main__':
     with wandb.init(project=project_name, name=name) as run:
         for i in range(n_epochs):
             print(f"Start Epoch {i}")
-            train(run, train_dataloader, model, optimizer, scheduler, log_loss_every, log_audio_every)
+            train(run, i, train_dataloader, model, optimizer, scheduler, log_loss_every, log_audio_every)
             if i % save_every == 0:
                 torch.save(model.state_dict(), f"{experiment_path}/model.pth")
                 torch.save(optimizer.state_dict(), f"{experiment_path}/optimizer.pth")
-            validation(run, model)
+            validation(run, i * len(train_dataloader), model)
