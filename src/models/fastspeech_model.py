@@ -3,6 +3,7 @@ from torch import nn
 from src.models.transformer_block import TransformerEncoderLayer
 from src.models.duration_predictor import DurationPredictor
 import math
+from torch.nn.utils.rnn import pad_sequence
 
 
 class Transformer(nn.Module):
@@ -51,19 +52,18 @@ class SinCosPositionalEncoding(nn.Module):
         return embeddings + self.pos_embedding[:embeddings.shape[0], :]
 
 
-def duplicate_by_duration(encoder_result, durations):
+def duplicate_by_duration(encoder_result, durations, device):
     bs = encoder_result.shape[0]
-    encoder_result = encoder_result.reshape(-1, encoder_result.shape[2])
-    melspec_len = durations[0].sum()
-    assert(torch.all(durations.sum(1) == melspec_len))
-    durations = durations.flatten()
-    durations_cumsum = durations.cumsum(0)
-    mask1 = torch.arange(bs * melspec_len)[None, :] < (durations_cumsum[:, None])
-    mask2 = torch.arange(bs * melspec_len)[None, :] >= (durations_cumsum - durations)[:, None]
-    mask = (mask2 * mask1).float()
-    encoder_result = mask.T @ encoder_result
-    encoder_result = encoder_result.reshape(bs, int(melspec_len.item()), encoder_result.shape[1])
-    return encoder_result
+    results = []
+    for i in range(bs):
+        melspec_len = durations[i].sum()
+        durations_cumsum = durations[i].cumsum(0)
+        mask1 = torch.arange(melspec_len)[None, :].to(device) < (durations_cumsum[:, None])
+        mask2 = torch.arange(melspec_len)[None, :].to(device) >= (durations_cumsum - durations[i])[:, None]
+        mask = (mask2 * mask1).float()
+        results.append(mask.T @ encoder_result[i])
+    results = pad_sequence(results).permute(1, 0, 2)
+    return results
 
 
 class FastSpeechModel(nn.Module):
@@ -78,7 +78,8 @@ class FastSpeechModel(nn.Module):
                        n_heads,
                        size_per_head,
                        normalization_type,
-                       dropout_prob):
+                       dropout_prob,
+                       device):
         super().__init__()
         if activation == 'relu':
             activation = nn.ReLU
@@ -100,6 +101,7 @@ class FastSpeechModel(nn.Module):
         self.decoder = Transformer(*args)
         self.output_layer = nn.Linear(model_size, output_size)
         self.duration_predictor = DurationPredictor(model_size)
+        self.device = device
 
     def forward(self, batch, train=True):
         tokens = batch["tokens"]
@@ -108,7 +110,7 @@ class FastSpeechModel(nn.Module):
         tokens_embeddings = self.embedding_layer(tokens)
         tokens_embeddings = tokens_embeddings + self.tokens_positions(tokens_embeddings)
 
-        attention_mask = (torch.arange(tokens.shape[1])[None, :] > tokens_length[:, None]).float()
+        attention_mask = (torch.arange(tokens.shape[1])[None, :].to(self.device) > tokens_length[:, None]).float()
         attention_mask[attention_mask == 1] = -torch.inf
         encoder_result = self.encoder(tokens_embeddings, attention_mask)
         length_predictions = self.duration_predictor(encoder_result).squeeze(2)
@@ -116,16 +118,16 @@ class FastSpeechModel(nn.Module):
         if train:
             melspec_length = batch["melspec_length"]
             duration_multipliers = batch["duration_multipliers"]
-            input_to_decoder = duplicate_by_duration(encoder_result, duration_multipliers)
-            mask = (torch.arange(input_to_decoder.shape[1])[None, :] <= melspec_length[:, None]).float()
+            input_to_decoder = duplicate_by_duration(encoder_result, duration_multipliers, self.device)
+            mask = (torch.arange(input_to_decoder.shape[1])[None, :].to(self.device) <= melspec_length[:, None]).float()
             input_to_decoder = input_to_decoder * mask[:, :, None]
-            attention_mask = (torch.arange(input_to_decoder.shape[1])[None, :] > melspec_length[:, None]).float()
+            attention_mask = (torch.arange(input_to_decoder.shape[1])[None, :].to(self.device) > melspec_length[:, None]).float()
             attention_mask[attention_mask == 1] = -torch.inf
         else:
             duration_multipliers = (torch.exp(length_predictions) - 1).round().int()
             duration_multipliers[duration_multipliers < 1] = 1
-            input_to_decoder = duplicate_by_duration(encoder_result, duration_multipliers)
-            attention_mask = torch.zeros(input_to_decoder.shape[:2])
+            input_to_decoder = duplicate_by_duration(encoder_result, duration_multipliers, self.device)
+            attention_mask = torch.zeros(input_to_decoder.shape[:2]).to(self.device)
         output = self.decoder(input_to_decoder, attention_mask)
         output = self.output_layer(output)
         output = output.permute(0, 2, 1)

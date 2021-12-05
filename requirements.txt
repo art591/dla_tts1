@@ -4,3 +4,4 @@ librosa
 matplotlib
 wandb
 tqdm
+googledrivedownloader
